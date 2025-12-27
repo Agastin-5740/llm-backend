@@ -3,7 +3,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 # Change user/password if needed
-SQLALCHEMY_DATABASE_URL = "mysql+pymysql://root:Agas5740@localhost:3306/ticket_db"
+SQLALCHEMY_DATABASE_URL = "mysql+pymysql://root:piwYxMnkOfBASuMSKlKTcpClxksGmrBx@switchback.proxy.rlwy.net:23272/ticket_db"
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
