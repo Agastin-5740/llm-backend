@@ -5,3 +5,4 @@ pymysql
 transformers
 torch
 python-multipart
+sentencepiece
