@@ -1,27 +1,38 @@
 """
 LLM-based natural language to SQL converter using FLAN-T5 (google/flan-t5-small)
-with PyTorch backend.
 
-Target table:
-    tickets(id, text, category, priority, status, created_at)
-
-Design:
-- Use FLAN-T5 only to infer intent (columns / count).
-- NEVER trust LLM to generate WHERE clauses.
-- Apply deterministic, rule-based SQL construction.
-- Supports structured filters + keyword search on text column.
+- Lazy-loads model to avoid blocking FastAPI startup (Render-safe)
+- Uses LLM only for column / count intent
+- Uses deterministic SQL construction
 """
 
 from typing import List
 import re
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 
-# ===================== MODEL LOAD =====================
+# ===================== MODEL CONFIG =====================
 
 MODEL_NAME = "google/flan-t5-small"
 
-tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME)
-model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME)
+_tokenizer = None
+_model = None
+
+
+def get_model():
+    """
+    Lazy-load tokenizer and model on first request.
+    Prevents Render startup timeout.
+    """
+    global _tokenizer, _model
+
+    if _tokenizer is None or _model is None:
+        print("Loading FLAN-T5 model...")
+        _tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME)
+        _model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME)
+        print("FLAN-T5 model loaded.")
+
+    return _tokenizer, _model
+
 
 # ===================== PROMPT =====================
 
@@ -43,6 +54,7 @@ Rules:
 - Output only column names or COUNT(*).
 """
 
+
 def build_prompt(question: str) -> str:
     return (
         SYSTEM_PROMPT.strip()
@@ -50,15 +62,12 @@ def build_prompt(question: str) -> str:
         + "\nExpression:"
     )
 
+
 # =====================================================
 # 🔹 KEYWORD EXTRACTION (TEXT COLUMN)
 # =====================================================
 
 def _extract_text_keywords(question: str) -> List[str]:
-    """
-    Extract meaningful keywords from user question
-    for safe LIKE-based text search.
-    """
     stop_words = {
         "show", "me", "all", "the", "tickets", "ticket",
         "with", "that", "are", "is", "of", "for", "in",
@@ -74,7 +83,8 @@ def _extract_text_keywords(question: str) -> List[str]:
         if w.lower() not in stop_words
     ]
 
-    return list(set(words))  # deduplicate
+    return list(set(words))
+
 
 # =====================================================
 # 🔹 WHERE CONDITION BUILDER
@@ -84,7 +94,6 @@ def _build_conditions_from_question(question: str) -> List[str]:
     q = question.lower()
     conditions = []
 
-    # ---------- Priority ----------
     if "high" in q:
         conditions.append("priority = 'High'")
     elif "medium" in q:
@@ -92,7 +101,6 @@ def _build_conditions_from_question(question: str) -> List[str]:
     elif "low" in q:
         conditions.append("priority = 'Low'")
 
-    # ---------- Category ----------
     if "technical" in q or "tech" in q:
         conditions.append("category = 'Technical'")
     if "billing" in q or "payment" in q or "refund" in q:
@@ -100,13 +108,11 @@ def _build_conditions_from_question(question: str) -> List[str]:
     if "general" in q or "account" in q or "profile" in q:
         conditions.append("category = 'General'")
 
-    # ---------- Status ----------
     if "open" in q:
         conditions.append("status = 'Open'")
     if "closed" in q or "resolved" in q:
         conditions.append("status = 'Closed'")
 
-    # ---------- Date ----------
     if "today" in q:
         conditions.append("DATE(created_at) = CURDATE()")
     elif "yesterday" in q:
@@ -116,16 +122,13 @@ def _build_conditions_from_question(question: str) -> List[str]:
     elif "this month" in q:
         conditions.append("created_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')")
 
-    # ---------- 🔥 TEXT SEARCH ----------
     keywords = _extract_text_keywords(question)
     if keywords:
-        like_clauses = [
-            f"LOWER(text) LIKE '%{kw}%'"
-            for kw in keywords
-        ]
-        conditions.append("(" + " OR ".join(like_clauses) + ")")
+        likes = [f"LOWER(text) LIKE '%{kw}%'" for kw in keywords]
+        conditions.append("(" + " OR ".join(likes) + ")")
 
     return conditions
+
 
 # =====================================================
 # 🔹 COLUMN EXPRESSION CLEANER
@@ -138,14 +141,13 @@ def _clean_columns_expression(expr: str) -> str:
         return "COUNT(*)"
 
     parts = [p.strip() for p in expr.split(",")]
-    valid = all(re.match(r"^[a-zA-Z0-9_() ]+$", p) for p in parts)
-
-    if valid:
+    if all(re.match(r"^[a-zA-Z0-9_() ]+$", p) for p in parts):
         forbidden = {"from", "where", "join", "limit", "tickets"}
         if not any(f in expr for f in forbidden):
             return ", ".join(parts)
 
     return "id, text, category, priority, status, created_at"
+
 
 # =====================================================
 # 🔹 MAIN SQL GENERATOR
@@ -154,7 +156,8 @@ def _clean_columns_expression(expr: str) -> str:
 def generate_sql_from_question(question: str) -> str:
     q_lower = question.lower()
 
-    # 1️⃣ Ask LLM for column hint
+    tokenizer, model = get_model()
+
     prompt = build_prompt(question)
     inputs = tokenizer(prompt, return_tensors="pt")
 
@@ -168,7 +171,6 @@ def generate_sql_from_question(question: str) -> str:
     expr = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     expr = _clean_columns_expression(expr)
 
-    # 2️⃣ Count or Select
     is_count = "how many" in q_lower or "count" in q_lower or "count(" in expr.lower()
 
     if is_count:
@@ -176,7 +178,6 @@ def generate_sql_from_question(question: str) -> str:
     else:
         select_clause = f"SELECT {expr}"
 
-    # 3️⃣ WHERE conditions
     conditions = _build_conditions_from_question(question)
 
     sql = select_clause + " FROM tickets"
@@ -188,6 +189,7 @@ def generate_sql_from_question(question: str) -> str:
         sql += " LIMIT 50"
 
     return sql + ";"
+
 
 # =====================================================
 # 🔹 SQL EXPLANATION
@@ -225,5 +227,4 @@ def explain_sql(sql: str) -> str:
         explanation.append("and limits the results to 50 records")
 
     return " ".join(explanation).capitalize() + "."
-
 
